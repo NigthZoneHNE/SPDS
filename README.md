@@ -40,12 +40,7 @@ cd SPDS
 pip install -r requirements.txt
 ```
 
-### Alternative Installation Methods
-- **Docker:** (if applicable)
-  ```bash
-  docker pull yourusername/spds:latest
-  docker run -it yourusername/spds:latest
-  ```
+
 
 ## 🎯 Usage
 

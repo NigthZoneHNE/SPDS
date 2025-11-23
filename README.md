@@ -152,8 +152,8 @@ pytest
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## 👥 Authors & Contributors
-- **Maintainer:** [Your Name](https://github.com/yourusername)
-- **Contributors:** [Contributor 1](https://github.com/contributor1), [Contributor 2](https://github.com/contributor2)
+- **Maintainer:** [Parsa Hosseinpour](https://github.com/yourusername)
+
 
 ## 🐛 Issues & Support
 - **Report Issues:** [Open an issue](https://github.com/yourusername/SPDS/issues)

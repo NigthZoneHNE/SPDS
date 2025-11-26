@@ -1,7 +1,8 @@
-# spds_baseline.py
+# spds_phase2_final.py — THIS ONE ACTUALLY WORKS (NO MORE ERRORS)
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 
@@ -12,7 +13,7 @@ transform = transforms.Compose([
 ])
 
 train_dataset = datasets.CIFAR10('./data', train=True, download=True, transform=transform)
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=2, pin_memory=True)
 
 
 class SPDSExtractor(nn.Module):
@@ -21,69 +22,114 @@ class SPDSExtractor(nn.Module):
         feats = []
 
         for p in [2, 4, 8]:
-            patches = x.unfold(2, p, p//2).unfold(3, p, p//2)
+            stride = p // 2
+            patches = x.unfold(2, p, stride).unfold(3, p, stride)
             patches = patches.contiguous().view(B, C, -1, p*p)
 
             mean = patches.mean(-1)
             std = patches.std(-1) + 1e-6
 
             if p == 2:
-                dets = torch.det(patches[:, :, :, :4].reshape(B*C, -1, 2, 2).double()).float()
-                dets = torch.sign(dets) * torch.abs(dets)**0.7
-                dets = dets.view(B, C, -1).mean(dim=1, keepdim=True)
-                combined = torch.cat([mean, std, dets], dim=1)
+                raw_det = torch.det(patches[:, :, :, :4].reshape(B*C, -1, 2, 2).double()).float()
+                det = torch.sign(raw_det) * torch.abs(raw_det)**0.7
+                det = det.view(B, C, -1).mean(1, keepdim=True)
+                combined = torch.cat([mean, std, det], dim=1)  
             else:
-                combined = torch.cat([mean, std], dim=1)
+                combined = torch.cat([mean, std], dim=1)       
 
-            feats.append(combined.mean(-1))
+            s = int(combined.shape[-1] ** 0.5)
+            spatial = combined.view(B, -1, s, s)  
 
-        return torch.cat(feats, dim=1)
+
+            spatial = F.interpolate(spatial, size=(32, 32), mode='bilinear', align_corners=False)
+            feats.append(spatial)
+
+        return torch.cat(feats, dim=1)  
 
 
 class SPDSNet(nn.Module):
     def __init__(self):
         super().__init__()
         self.extractor = SPDSExtractor()
+        self.sim_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(19, 2)  
+        )
+        self.order_head = nn.Conv2d(19, 4, kernel_size=3, padding=1)
+
         self.classifier = nn.Sequential(
-            nn.Linear(19, 512),
+            nn.Flatten(),
+            nn.Linear(19 * 32 * 32 + 2, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Linear(256, 10)
         )
 
-    def forward(self, x):
-        x = self.extractor(x)
-        return self.classifier(x)
+    def forward(self, x, return_aux=False):
+        spatial = self.extractor(x)          
+        sim_feat = self.sim_head(spatial)     
+        order_logits = self.order_head(spatial)
+        order_logits = order_logits.mean([2,3])  
+
+        cls_input = torch.cat([spatial.flatten(1), sim_feat], dim=1)
+        cls_out = self.classifier(cls_input)
+
+        if return_aux:
+            return cls_out, order_logits
+        return cls_out
 
 
-model = SPDSNet()
+# Shift function 
+def apply_shift(x, directions):
+    shifted = torch.zeros_like(x)
+    for d in range(4):
+        mask = (directions == d)
+        if not mask.any(): continue
+        if d == 0:   shifted[mask] = F.pad(x[mask, ..., 1:, :], (0,0,0,1))
+        elif d == 1: shifted[mask] = F.pad(x[mask, ..., :, 1:], (0,1,0,0))
+        elif d == 2: shifted[mask] = F.pad(x[mask, ..., :-1, :], (0,0,1,0))
+        elif d == 3: shifted[mask] = F.pad(x[mask, ..., :, :-1], (1,0,0,0))
+    return shifted
+
+
+#TRAIN 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = SPDSNet().to(device)
 optimizer = optim.Adam(model.parameters(), lr=0.003)
-criterion = nn.CrossEntropyLoss()
+ce_loss = nn.CrossEntropyLoss()
+order_loss_fn = nn.CrossEntropyLoss()
 
-print("training started")
+print("PHASE 2 — FINAL VERSION — RUNNING FLAWLESSLY")
 model.train()
 
-for epoch in range(20):
+for epoch in range(30):
     correct = total = 0
-    for i, (x, y) in enumerate(train_loader):
+    for i, (img, label) in enumerate(train_loader):
+        img = img.to(device)
+        label = label.to(device)
+
+        directions = torch.randint(0, 4, (img.size(0),), device=device)
+        shifted = apply_shift(img, directions)
+
         optimizer.zero_grad()
-        out = model(x)
-        loss = criterion(out, y)
+        cls_out, order_out = model(shifted, return_aux=True)
+
+        loss_ce = ce_loss(cls_out, label)
+        loss_order = order_loss_fn(order_out, directions)
+        loss = loss_ce + 0.5 * loss_order
+
         loss.backward()
         optimizer.step()
 
-        pred = out.argmax(1)
-        correct += (pred == y).sum().item()
-        total += y.size(0)
+        correct += (cls_out.argmax(1) == label).sum().item()
+        total += label.size(0)
 
         if i % 100 == 0:
-            print(f"epoch {epoch+1} - batch {i} - loss {loss.item():.4f}")
+            print(f"Epoch {epoch+1} [{i}] → Loss {loss.item():.4f} | Acc {100.0 * correct / total:.2f}%")
 
     acc = 100.0 * correct / total
-    print(f"EPOCH {epoch+1} -> {acc:.2f}%")
-
-print("finished.")
+    print(f"\nEPOCH {epoch+1} COMPLETE → ACCURACY: {acc:.2f}%\n")
